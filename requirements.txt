@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+playwright
+supabase
+pandas
+python-dotenv
