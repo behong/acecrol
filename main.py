@@ -10,7 +10,6 @@ from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# 1. 초기 설정
 load_dotenv()
 app = FastAPI()
 
@@ -38,79 +37,90 @@ def safe_format_date(date_str):
     except: return datetime.now().strftime("%Y-%m-%d")
 
 async def take_debug_screenshot(page, name):
-    """Render 로그에 현재 화면을 강제로 텍스트화해서 남깁니다."""
     try:
-        screenshot_bytes = await page.screenshot(type="jpeg", quality=50)
+        screenshot_bytes = await page.screenshot(type="jpeg", quality=40)
         b64_str = base64.b64encode(screenshot_bytes).decode()
-        logger.error(f"📸 [{name}] 스크린샷 텍스트 로그 (디버깅용): data:image/jpeg;base64,{b64_str[:100]}...")
-        # 이 텍스트를 복사해서 브라우저 주소창에 넣으면 화면이 보입니다.
+        logger.error(f"📸 [{name}] 화면 확인용 로그: data:image/jpeg;base64,{b64_str}")
     except: pass
 
 # --- [핵심 로직] ---
 
 async def run_production_crawl():
-    logger.info("🚀 [CRAWL] 정밀 수집 프로세스를 시작합니다.")
+    logger.info("🚀 [CRAWL] 정밀 수집 프로세스를 가동합니다.")
     
     async with async_playwright() as p:
-        # 가벼운 실행을 위해 옵션 추가
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = await browser.new_context(
-            viewport={'width': 1280, 'height': 1000},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+        context = await browser.new_context(viewport={'width': 1280, 'height': 1000})
         page = await context.new_page()
 
         try:
             # 1. 로그인
-            logger.info("🔗 로그인 페이지 접속...")
+            logger.info("🔗 로그인 시도...")
             await page.goto("https://www.aipartner.com/integrated/login?serviceCode=1000", wait_until="domcontentloaded")
             await page.fill('input[placeholder*="아이디"]', USER_ID)
             await page.fill('input[placeholder*="비밀번호"]', USER_PW)
             await page.keyboard.press("Enter")
             
-            await page.wait_for_timeout(8000) # 로그인 처리 대기
+            # [중요] 로그인 후 '로그아웃' 버튼이나 '대시보드' 요소가 보일 때까지 대기
+            logger.info("⏳ 로그인 승인 대기 중...")
+            await page.wait_for_timeout(10000) 
             
-            # 2. 리스트 페이지 이동
-            logger.info("🔗 매물 리스트 페이지로 이동...")
-            # 타임아웃을 90초로 더 늘리고, 로딩 전략을 여유 있게 설정
+            # 2. 팝업 제거 (화면을 가리는 모든 레이어 팝업 닫기 시도)
+            logger.info("🧹 방해 요소(팝업) 제거 중...")
+            await page.evaluate("""() => {
+                const closeBtns = document.querySelectorAll('.close, .btnClose, .btn-close, [class*="close"]');
+                closeBtns.forEach(btn => btn.click());
+                // 배경 어두워지는 레이어 강제 삭제
+                const overlays = document.querySelectorAll('.SYlayerPopupWrap, .modal-backdrop, [id*="popup"]');
+                overlays.forEach(ov => ov.style.display = 'none');
+            }""")
+            
+            # 3. 매물 리스트 페이지 이동
+            logger.info("🔗 매물 리스트 페이지로 이동합니다.")
             await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load", timeout=90000)
             
-            # 테이블 확인 (셀렉터 단순화)
-            logger.info("⏳ 테이블이 나타날 때까지 대기...")
-            try:
-                await page.wait_for_selector("table", timeout=60000)
-            except Exception:
-                await take_debug_screenshot(page, "Table_Timeout")
-                raise Exception("테이블 로딩 타임아웃 (화면 확인 필요)")
+            # 테이블 로딩 확인 전 한 번 더 팝업 제거
+            await page.wait_for_timeout(3000)
+            await page.evaluate("() => document.querySelectorAll('.SYlayerPopupWrap').forEach(p => p.remove())")
 
-            # 100개씩 보기 (실패해도 진행)
+            logger.info("⏳ 테이블 렌더링 확인 중...")
             try:
-                await page.click(".sortingWrap .selectBox a.selectInfoOrder", timeout=10000)
+                # 'table' 보다는 실제 데이터가 들어있는 행(tr)이 생길 때까지 대기
+                await page.wait_for_selector("table tbody tr", timeout=60000)
+            except Exception:
+                await take_debug_screenshot(page, "List_Fail")
+                raise Exception("리스트 테이블을 찾을 수 없습니다. (스크린샷 확인 권장)")
+
+            # 100개씩 보기 (실패해도 데이터 수집은 진행)
+            try:
+                await page.click(".sortingWrap a.selectInfoOrder", timeout=10000)
                 await page.click("a.perPage[data-cd='100']", timeout=10000)
                 await page.wait_for_timeout(5000)
-            except: logger.warning("⚠️ 100개씩 보기 설정 실패")
+            except: pass
 
-            # 3. 매물번호 수집
+            # 4. 매물번호 리스트 확보
             list_items = await page.evaluate("""() => {
-                return Array.from(document.querySelectorAll("table tbody tr"))
+                return Array.from(document.querySelectorAll("table.tableAdSale tbody tr"))
                     .map(row => ({ "article_no": row.querySelector(".numberA")?.innerText.trim() || "" }))
                     .filter(i => i.article_no.length > 3);
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 대상 매물: {total_len}건. 상세 분석 시작.")
+            logger.info(f"📊 수집 대상 {total_len}건 확보. 상세 분석 루프 진입.")
 
-            # 4. 상세 페이지 루프
+            # 5. 상세 페이지 순회
             for idx, item in enumerate(list_items):
                 article_no = item['article_no']
                 detail_url = f"https://www.aipartner.com/offerings/detail/{article_no}"
                 
-                await asyncio.sleep(random.uniform(5.0, 10.0)) # 더 느리고 안전하게
-                logger.info(f"🔎 [{idx+1}/{total_len}] 분석 중: {article_no}")
+                await asyncio.sleep(random.uniform(5.0, 10.0))
+                logger.info(f"🔎 [{idx+1}/{total_len}] 매물번호: {article_no}")
                 
                 try:
                     await page.goto(detail_url, wait_until="domcontentloaded", timeout=60000)
-                    
+                    await page.wait_for_timeout(3000)
+
+                    # 상세 데이터 추출
                     details = await page.evaluate("""() => {
                         const results = {};
                         const getValue = (label) => {
@@ -168,12 +178,12 @@ async def run_production_crawl():
                     }
                     supabase.table("real_estate_articles").upsert(payload, on_conflict="article_no").execute()
                 except Exception as e:
-                    logger.error(f"⚠️ {article_no} 상세 페이지 에러: {e}")
+                    logger.error(f"⚠️ {article_no} 상세 페이지 스킵: {e}")
                     continue
 
             logger.info(f"✨ [SUCCESS] {total_len}건 수집 완료!")
         except Exception as e:
-            logger.error(f"❌ [CRITICAL] 프로세스 실패: {e}")
+            logger.error(f"❌ [CRITICAL] 수집 프로세스 중단: {e}")
         finally:
             await browser.close()
 
@@ -194,4 +204,5 @@ async def trigger_crawl(background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), proxy_headers=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, proxy_headers=True)
