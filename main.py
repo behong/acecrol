@@ -21,15 +21,14 @@ if not logger.handlers:
 
 # 2. 전역 변수 및 설정
 last_crawl_time = None
-CRAWL_INTERVAL_SECONDS = 10800  # 3시간 주기
+CRAWL_INTERVAL_SECONDS = 10800 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 3. 크롤링 대상 설정
 LOGIN_URL = "https://www.aipartner.com/integrated/login?serviceCode=1000"
 MONITORING_URL = "https://www.aipartner.com/monitoring/monitoring"
-MY_ADS_URL = "https://www.aipartner.com/offerings/ad_list" # 새로 추가된 타켓
+MY_ADS_URL = "https://www.aipartner.com/offerings/ad_list" 
 
 USER_ID = os.getenv("AI_PARTNER_ID", "lljh7771")
 USER_PW = os.getenv("AI_PARTNER_PW", "")
@@ -51,15 +50,14 @@ def format_date(date_str):
         return datetime.now().strftime("%Y-%m-%d")
 
 async def save_to_supabase(all_data, source_name):
-    """공통 저장 함수"""
     if not all_data:
-        logger.warning(f"⚠️ [{source_name}] 저장할 데이터가 없습니다.")
+        logger.warning(f"⚠️ [{source_name}] 추출된 데이터가 0건입니다. (Selector 확인 필요)")
         return
 
     logger.info(f"📤 [{source_name}] {len(all_data)}건 DB 동기화 시도")
     upload_list = [{
         "article_no": item["article_no"],
-        "articlename": item.get("complex_nm", "아파트 매물"),
+        "articlename": item.get("complex_nm", "아파트"),
         "realestatetypename": "아파트",
         "tradetypename": item.get("deal_type"),
         "floorinfo": item.get("floor"),
@@ -67,8 +65,8 @@ async def save_to_supabase(all_data, source_name):
         "articleconfirmymd": format_date(item.get("reg_date", "")),
         "articlefeaturedesc": f"{item.get('dong', '')} / {source_name}",
         "buildingname": item.get("complex_nm", "").split(' '),
-        "realtorname": item.get("agency", "자이에이스"),
-        "cppcarticleurl": f"https://new.land.naver.com/?articleNo={item['article_no']}" if item.get("article_no") else "",
+        "realtorname": "자이에이스",
+        "cppcarticleurl": f"https://new.land.naver.com/?articleNo={item['article_no']}",
         "isPopular": False
     } for item in all_data if item.get("article_no")]
 
@@ -80,28 +78,88 @@ async def save_to_supabase(all_data, source_name):
     except Exception as e:
         logger.error(f"❌ [DB ERROR] {e}")
 
-# --- [핵심 로직: 모니터링 페이지용] ---
+# --- [핵심 로직: 내 매물 관리(ad_list) 정밀 추출] ---
+
+async def crawl_ad_list():
+    async with async_playwright() as p:
+        logger.info("🚀 [TEST] 내 매물 관리(ad_list) 수집 시작")
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(viewport={'width': 1600, 'height': 1000})
+        page = await context.new_page()
+        try:
+            # 1. 로그인
+            await page.goto(LOGIN_URL)
+            await page.fill('input[placeholder*="아이디"]', USER_ID)
+            await page.fill('input[placeholder*="비밀번호"]', USER_PW)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(3000)
+            
+            # 2. 내 매물 관리로 이동
+            await page.goto(MY_ADS_URL, wait_until="networkidle")
+            
+            # 페이지 로딩 확인 (테이블이 나타날 때까지 최대 15초 대기)
+            try:
+                await page.wait_for_selector("table tbody tr", timeout=15000)
+            except:
+                logger.error("❌ [TEST] 테이블 로딩 실패 (페이지 형식이 다를 수 있음)")
+                return
+
+            # 3. 데이터 추출 (더 유연한 JS 셀렉터 사용)
+            all_data = await page.evaluate("""() => {
+                const results = [];
+                // 모든 tr을 찾되, 헤더나 데이터 없는 행은 제외
+                const rows = Array.from(document.querySelectorAll("table tbody tr"));
+                
+                rows.forEach(row => {
+                    const cols = row.querySelectorAll("td");
+                    if (cols.length >= 5) {
+                        // 'ad_list' 페이지 특유의 매물 번호 추출 (여러 가능성 대비)
+                        const raw_no = row.querySelector("[data-seq]")?.getAttribute("data-seq") 
+                                     || row.querySelector("a[href*='articleNo']")?.innerText.replace(/[^0-9]/g, "")
+                                     || cols?.innerText.trim();
+                        
+                        results.push({
+                            "article_no": raw_no,
+                            "complex_nm": cols?.innerText.trim(),
+                            "deal_type": cols?.innerText.trim(),
+                            "price": cols?.innerText.trim(),
+                            "floor": cols?.innerText.trim(),
+                            "reg_date": cols?.innerText.trim()
+                        });
+                    }
+                });
+                return results.filter(i => i.article_no && i.article_no.length > 5);
+            }""")
+            
+            logger.info(f"🔍 [TEST] 추출 시도 결과: {len(all_data)}건 발견")
+            await save_to_supabase(all_data, "내매물관리")
+            
+        except Exception as e:
+            logger.error(f"❌ [TEST ERROR] {e}")
+        finally:
+            await browser.close()
+
+# --- [기존 모니터링 로직 유지] ---
 
 async def crawl_monitoring():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            # 로그인
             await page.goto(LOGIN_URL)
             await page.fill('input[placeholder*="아이디"]', USER_ID); await page.fill('input[placeholder*="비밀번호"]', USER_PW)
             await page.keyboard.press("Enter")
-            await page.wait_for_url("**/monitoring/**", timeout=60000)
+            await page.wait_for_timeout(3000)
+            await page.goto(MONITORING_URL, wait_until="domcontentloaded")
             
             all_data = []
             for info in COMPLEXES:
                 logger.info(f"📍 단지 수집: {info['nm']}")
                 await page.click("#mainAreaText")
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(700)
                 await page.click(f"a.mainArea[data-cd='{info['cd']}']")
                 await page.wait_for_timeout(3500)
                 
-                # 데이터 추출 JS (기존 로직 유지)
                 page_data = await page.evaluate(f"""() => {{
                     return Array.from(document.querySelectorAll("#reportTable tbody tr")).map(row => {{
                         const cols = row.querySelectorAll("td");
@@ -112,49 +170,12 @@ async def crawl_monitoring():
                             "price": cols?.innerText.trim(),
                             "dong": cols?.innerText.trim(),
                             "floor": cols?.innerText.trim(),
-                            "reg_date": cols?.innerText.trim(),
-                            "agency": cols?.innerText.trim()
+                            "reg_date": cols?.innerText.trim()
                         }};
                     }}).filter(item => item.article_no);
                 }}""")
                 all_data.extend(page_data)
-            
             await save_to_supabase(all_data, "모니터링")
-        finally:
-            await browser.close()
-
-# --- [핵심 로직: 내 매물 관리(ad_list) 테스트용] ---
-
-async def crawl_ad_list():
-    async with async_playwright() as p:
-        logger.info("🚀 [TEST] 내 매물 관리(ad_list) 수집 시작")
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            # 로그인 및 이동
-            await page.goto(LOGIN_URL)
-            await page.fill('input[placeholder*="아이디"]', USER_ID); await page.fill('input[placeholder*="비밀번호"]', USER_PW)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(3000)
-            await page.goto(MY_ADS_URL, wait_until="networkidle")
-            
-            # 테이블 데이터 긁기
-            all_data = await page.evaluate("""() => {
-                const rows = Array.from(document.querySelectorAll("table tbody tr"));
-                return rows.map(row => {
-                    const cols = row.querySelectorAll("td");
-                    return {
-                        "article_no": row.querySelector("[data-seq], a")?.innerText.replace(/[^0-9]/g, ""),
-                        "complex_nm": cols?.innerText.trim(),
-                        "deal_type": cols?.innerText.trim(),
-                        "price": cols?.innerText.trim(),
-                        "floor": cols?.innerText.trim(),
-                        "reg_date": cols?.innerText.trim()
-                    };
-                }).filter(i => i.article_no);
-            }""")
-            
-            await save_to_supabase(all_data, "내매물관리")
         finally:
             await browser.close()
 
@@ -165,21 +186,18 @@ async def root(): return {"status": "online"}
 
 @app.api_route("/run-crawl", methods=["GET", "HEAD"])
 async def trigger_crawl(background_tasks: BackgroundTasks):
-    """정식 주기 수집 (3시간 마다)"""
     global last_crawl_time
     now = datetime.now()
     if last_crawl_time is None or (now - last_crawl_time).total_seconds() >= CRAWL_INTERVAL_SECONDS:
         last_crawl_time = now
         background_tasks.add_task(crawl_monitoring)
-        return {"status": "started", "last_run": str(last_crawl_time)}
-    return {"status": "skipping", "message": "휴식 중"}
+        return {"status": "started"}
+    return {"status": "skipping"}
 
 @app.api_route("/test-crawl", methods=["GET", "HEAD"])
 async def trigger_test(background_tasks: BackgroundTasks):
-    """새로운 ad_list 페이지 수집 테스트"""
-    logger.info("📡 [TEST] 내 매물 페이지 수집 수동 호출")
     background_tasks.add_task(crawl_ad_list)
-    return {"status": "test_started", "target": "ad_list"}
+    return {"status": "test_started"}
 
 if __name__ == "__main__":
     import uvicorn
