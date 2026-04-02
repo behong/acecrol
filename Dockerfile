@@ -1,5 +1,5 @@
-# Playwright 공식 파이썬 이미지 사용 (브라우저가 이미 포함됨)
-FROM mcr.microsoft.com/playwright/python:v1.42.0-jammy
+# 기존 v1.42.0에서 v1.58.0으로 업데이트 (Playwright 요구사항 반영)
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
 # 작업 디렉토리 설정
 WORKDIR /app
