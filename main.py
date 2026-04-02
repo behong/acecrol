@@ -41,7 +41,7 @@ COMPLEXES = [
 # --- [기능별 유틸리티 함수] ---
 
 def format_date(date_str):
-    """'26.04.01' 형식을 '2026-04-01'로 변환"""
+    """'26.04.01' -> '2026-04-01' 변환"""
     try:
         return datetime.strptime(date_str, "%y.%m.%d").strftime("%Y-%m-%d")
     except:
@@ -55,7 +55,6 @@ async def login_process(page):
     await page.fill('input[placeholder*="비밀번호"]', USER_PW)
     await page.keyboard.press("Enter")
     
-    # 로그인 후 홈 또는 모니터링 페이지로 이동 대기
     await page.wait_for_function(
         "() => window.location.href.includes('home') || window.location.href.includes('monitoring')", 
         timeout=60000
@@ -68,18 +67,18 @@ async def login_process(page):
     logger.info("✅ 로그인 및 수집 페이지 도착")
 
 async def set_view_to_100(page):
-    """100개씩 보기 설정 (속도 최적화)"""
+    """100개씩 보기 설정"""
     try:
         await page.click("#chkPerPage")
         await page.wait_for_timeout(500)
         await page.click("a.perPage[data-cd='100']")
-        await page.wait_for_timeout(4000) # 데이터 로딩 대기
+        await page.wait_for_timeout(4000)
         logger.info("⚡ '100개씩 보기' 설정 완료")
     except Exception as e:
-        logger.warning(f"⚠️ 보기 설정 변경 실패(기본값 수집): {e}")
+        logger.warning(f"⚠️ 보기 설정 변경 실패: {e}")
 
 async def extract_current_page(page, complex_nm):
-    """자바스크립트로 현재 화면의 매물 데이터 추출"""
+    """데이터 추출 JS"""
     return await page.evaluate(f"""
         () => {{
             const results = [];
@@ -108,13 +107,11 @@ async def extract_current_page(page, complex_nm):
     """)
 
 async def save_to_supabase(all_data):
-    """수집 데이터를 Supabase에 Upsert (중복 제거)"""
+    """Supabase Upsert"""
     if not all_data:
-        logger.warning("⚠️ 저장할 데이터가 없습니다.")
         return
 
     logger.info(f"📤 Supabase 동기화 시도 (총 {len(all_data)}건)")
-    
     upload_list = [{
         "article_no": item["article_no"],
         "articlename": f"{item['complex_nm']} {item['area']}",
@@ -131,11 +128,10 @@ async def save_to_supabase(all_data):
     } for item in all_data if item["article_no"]]
 
     try:
-        # 100건 단위로 끊어서 전송
         for i in range(0, len(upload_list), 100):
             chunk = upload_list[i:i + 100]
             supabase.table("real_estate_articles").upsert(chunk, on_conflict="article_no").execute()
-            logger.info(f"✅ {min(i + 100, len(upload_list))}건 데이터 처리 완료")
+            logger.info(f"✅ {min(i + 100, len(upload_list))}건 처리 완료")
         logger.info("✨ 모든 데이터 동기화 완료")
     except Exception as e:
         logger.error(f"❌ Supabase 저장 실패: {e}")
@@ -143,16 +139,14 @@ async def save_to_supabase(all_data):
 # --- [핵심 실행 로직] ---
 
 async def run_crawler_logic():
-    """전체 크롤링 프로세스 오케스트레이션"""
     async with async_playwright() as p:
         logger.info("🚀 크롤링 프로세스 시작")
-        browser = await p.chromium.launch(headless=True) # 서버 배포 필수 설정
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(viewport={'width': 1600, 'height': 1000})
         page = await context.new_page()
 
         try:
             await login_process(page)
-            
             all_collected_data = []
             for info in COMPLEXES:
                 logger.info(f"📍 단지 수집 시작: {info['nm']}")
@@ -160,16 +154,12 @@ async def run_crawler_logic():
                 await page.wait_for_timeout(700)
                 await page.click(f"a.mainArea[data-cd='{info['cd']}']")
                 await page.wait_for_timeout(3500)
-
                 await set_view_to_100(page)
 
                 current_page = 1
                 while True:
                     page_data = await extract_current_page(page, info["nm"])
                     all_collected_data.extend(page_data)
-                    logger.info(f"  📄 {info['nm']} - {current_page}P 완료 ({len(page_data)}건)")
-
-                    # 다음 페이지 버튼 체크
                     next_btn = page.locator(".btnArrow.next")
                     if await next_btn.is_visible():
                         next_val = await next_btn.get_attribute("data-value")
@@ -179,34 +169,28 @@ async def run_crawler_logic():
                             await page.wait_for_timeout(3000)
                         else: break
                     else: break
-            
             await save_to_supabase(all_collected_data)
-            
         except Exception as e:
-            logger.error(f"❌ 크롤링 도중 치명적 에러 발생: {e}")
+            logger.error(f"❌ 에러 발생: {e}")
         finally:
             await browser.close()
             logger.info("🔚 크롤링 프로세스 종료")
 
-# --- [FastAPI 엔드포인트] ---
+# --- [FastAPI 엔드포인트: HEAD 메서드 허용 추가] ---
 
-@app.get("/run-crawl")
-async def trigger_crawl(background_tasks: BackgroundTasks):
-    """UptimeRobot이 호출할 주소 (예: /run-crawl)"""
-    logger.info("📡 외부 API 호출 감지 - 크롤링 작업을 백그라운드에 등록합니다.")
-    background_tasks.add_task(run_crawler_logic)
-    return {
-        "status": "started", 
-        "message": "크롤링이 백그라운드에서 시작되었습니다. Render Logs 탭에서 진행 상황을 확인하세요."
-    }
-
-@app.get("/")
+@app.get("/", methods=["GET", "HEAD"])
 async def root():
-    """서버 생존 확인용"""
-    return {"status": "online", "service": "Estate Crawler API Server"}
+    """서버 상태 확인용 (UptimeRobot 에러 방지)"""
+    return {"status": "online", "service": "Estate Crawler"}
+
+@app.get("/run-crawl", methods=["GET", "HEAD"])
+async def trigger_crawl(background_tasks: BackgroundTasks):
+    """크롤링 시작용 (UptimeRobot 에러 방지)"""
+    logger.info("📡 외부 API 호출 감지 (GET/HEAD) - 작업을 예약합니다.")
+    background_tasks.add_task(run_crawler_logic)
+    return {"status": "started", "message": "Crawler started in background"}
 
 if __name__ == "__main__":
     import uvicorn
-    # Render 환경의 PORT 번호를 자동으로 인식합니다.
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
