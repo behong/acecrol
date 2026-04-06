@@ -22,35 +22,48 @@ if not logger.handlers:
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
-# 2. 전역 변수 및 설정 (12시간 주기)
+# 2. 전역 변수 설정
 last_crawl_time = None
-CRAWL_INTERVAL_SECONDS = 43200  # 12시간
+CRAWL_INTERVAL_SECONDS = 43200 
 
-# 환경 변수 로드
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
+supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 USER_ID = os.getenv("AI_PARTNER_ID")
 USER_PW = os.getenv("AI_PARTNER_PW")
 
-# --- [유틸리티 함수] ---
+# --- [유틸리티 함수: 금액 및 데이터 정제] ---
 
-def clean_text(text):
-    """숫자 외 단위 및 콤마 제거"""
-    if not text: return ""
-    return text.replace("개", "").replace("대", "").replace("원", "").replace("만원", "").replace(",", "").strip()
+def format_korean_price(price_str):
+    """'125000' -> '12억 5,000 (125,000)' 변환"""
+    try:
+        clean_val = re.sub(r'[^0-9]', '', price_str)
+        if not clean_val: return price_str
+        
+        val = int(clean_val)
+        if val == 0: return "0"
+        
+        uk = val // 10000
+        man = val % 10000
+        
+        parts = []
+        if uk > 0: parts.append(f"{uk}억")
+        if man > 0: parts.append(f"{man:,}") # 3자리 쉼표 포함
+            
+        korean_txt = " ".join(parts) if parts else ""
+        comma_numeric = f"{val:,}"
+        return f"{korean_txt} ({comma_numeric})"
+    except:
+        return price_str
 
 def safe_format_date(date_str):
-    """날짜 형식 변환"""
+    """'26.04.02' -> '2026-04-02' 변환"""
     try:
+        # 물결표가 있는 경우 앞의 날짜만 사용
         raw = date_str.split('~').strip() if '~' in date_str else date_str.strip()
         return datetime.strptime(raw, "%y.%m.%d").strftime("%Y-%m-%d")
     except:
         return datetime.now().strftime("%Y-%m-%d")
 
 async def take_debug_screenshot(page, name):
-    """에러 발생 시 화면을 로그에 남김"""
     try:
         screenshot_bytes = await page.screenshot(type="jpeg", quality=40)
         b64_str = base64.b64encode(screenshot_bytes).decode()
@@ -60,10 +73,9 @@ async def take_debug_screenshot(page, name):
 # --- [핵심 크롤링 로직] ---
 
 async def run_full_production_crawl():
-    logger.info("🚀 [CRAWL] 상세 정보 포함 정밀 수집을 시작합니다.")
+    logger.info("🚀 [CRAWL] 정밀 수집(층수/금액 보정 적용)을 시작합니다.")
     
     async with async_playwright() as p:
-        # 가벼운 실행 옵션
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         context = await browser.new_context(
             viewport={'width': 1280, 'height': 1000},
@@ -72,54 +84,20 @@ async def run_full_production_crawl():
         page = await context.new_page()
 
         try:
-            # 1. 로그인 단계
-            logger.info("🔗 로그인 페이지 접속...")
+            # 1. 로그인
             await page.goto("https://www.aipartner.com/integrated/login?serviceCode=1000", wait_until="domcontentloaded")
             await page.fill('input[placeholder*="아이디"]', USER_ID)
             await page.fill('input[placeholder*="비밀번호"]', USER_PW)
             
-            logger.info("⏳ 로그인 요청 및 대시보드 안착 대기...")
             async with page.expect_navigation(wait_until="load", timeout=60000):
                 await page.keyboard.press("Enter")
-            
-            await page.wait_for_timeout(5000) # 정착 시간
-
-            # 2. 방해 요소(팝업) 제거
-            logger.info("Sweep: 🧹 모든 팝업 및 레이어 제거 시도...")
-            try:
-                await page.evaluate("""() => {
-                    const selectors = ['.close', '.btnClose', '.btn-close', '.not-today', '.SYlayerPopupWrap', '#aipartner-popup-layout'];
-                    selectors.forEach(s => {
-                        document.querySelectorAll(s).forEach(el => {
-                            if(el.click && el.tagName !== 'DIV') el.click();
-                            el.style.display = 'none';
-                        });
-                    });
-                }""")
-            except: pass
-
-            # 3. 매물 리스트 페이지 이동
-            logger.info("🔗 매물 리스트 페이지로 이동합니다.")
-            await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load", timeout=90000)
             await page.wait_for_timeout(5000)
 
-            logger.info("⏳ 테이블 로딩 대기 중...")
-            try:
-                await page.wait_for_selector("table.tableAdSale tbody tr", timeout=60000)
-            except Exception:
-                await take_debug_screenshot(page, "List_Fail")
-                raise Exception("리스트 테이블을 찾지 못했습니다.")
+            # 2. 리스트 페이지 이동 및 테이블 대기
+            await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load", timeout=90000)
+            await page.wait_for_selector("table.tableAdSale tbody tr", timeout=60000)
 
-            # 100개씩 보기 설정
-            try:
-                await page.click(".sortingWrap a.selectInfoOrder", timeout=10000)
-                await page.wait_for_timeout(1000)
-                await page.click("a.perPage[data-cd='100']", timeout=10000)
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(5000)
-            except: pass
-
-            # 4. 수집 대상 매물 번호 확보
+            # 3. 매물번호 수집
             list_items = await page.evaluate("""() => {
                 return Array.from(document.querySelectorAll("table.tableAdSale tbody tr"))
                     .map(row => ({ "article_no": row.querySelector(".numberA")?.innerText.trim() || "" }))
@@ -127,14 +105,13 @@ async def run_full_production_crawl():
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 총 {total_len}건 수집 시작.")
+            logger.info(f"📊 총 {total_len}건 상세 분석 루프 시작.")
 
-            # 5. 상세 페이지 순회 분석
+            # 4. 상세 페이지 순회
             for idx, item in enumerate(list_items):
                 article_no = item['article_no']
                 detail_url = f"https://www.aipartner.com/offerings/detail/{article_no}"
                 
-                # 차단 방지를 위해 천천히 이동
                 await asyncio.sleep(random.uniform(5.0, 9.0))
                 logger.info(f"🔎 [{idx+1}/{total_len}] 매물 분석: {article_no}")
                 
@@ -151,7 +128,6 @@ async def run_full_production_crawl():
                         res.name = document.querySelector(".saleDetailName")?.innerText.trim() || "";
                         res.price = getV("매물 가격");
                         res.date = getV("등록일");
-                        res.move = getV("입주 가능일");
                         res.floor = getV("층");
                         res.room = getV("방수");
                         res.bath = getV("욕실수");
@@ -163,33 +139,44 @@ async def run_full_production_crawl():
                         res.fee = document.querySelector(".price-wrap.total .price")?.innerText.trim() || "0";
                         res.feat = getV("매물특징");
                         res.memo = document.querySelector("textarea")?.value || "";
+                        res.move = getV("입주 가능일");
                         return res;
                     }""")
 
-                    # 데이터 가공
-                    floor_match = re.findall(r'\d+', details.get('floor', ''))
-                    curr_f = floor_match if floor_match else ""
-                    total_f = floor_match[-1] if len(floor_match) > 1 else ""
+                    # --- [중요: 데이터 정제 로직] ---
+                    # 1. 이름에서 괄호(매물번호) 제거: "동천자이 104동 2401호 (58461971)" -> "동천자이 104동 2401호"
+                    clean_name = details['name'].split('(').strip()
+                    
+                    # 2. 층수 정보만 추출: "동천자이 104동 2401호" -> "2401호"
+                    extracted_floor = clean_name.split(' ')[-1] if ' ' in clean_name else ""
+                    
+                    # 3. 금액 한글 포맷팅
+                    formatted_price = format_korean_price(details['price'])
+
+                    # 4. 상세 층수 숫자만 추출 (예: "24/36")
+                    floor_nums = re.findall(r'\d+', details.get('floor', ''))
+                    curr_f = floor_nums if floor_nums else ""
+                    total_f = floor_nums[-1] if len(floor_nums) > 1 else ""
 
                     payload = {
                         "article_no": article_no,
-                        "articlename": details['name'],
+                        "articlename": clean_name,
                         "realestatetypename": "아파트",
                         "tradetypename": "매매" if "매매" in details['name'] else "전세",
-                        "dealorwarrantprc": clean_text(details['price']),
+                        "dealorwarrantprc": formatted_price, # "12억 5,000 (125,000)"
                         "articleconfirmymd": safe_format_date(details['date']),
-                        "buildingname": details['name'].split(' '),
-                        "floorinfo": details['name'].split(' ')[-1],
-                        "room_count": clean_text(details['room']),
-                        "bath_count": clean_text(details['bath']),
+                        "buildingname": clean_name.split(' '),
+                        "floorinfo": extracted_floor, # "2401호"
+                        "room_count": re.sub(r'[^0-9]', '', details['room']),
+                        "bath_count": re.sub(r'[^0-9]', '', details['bath']),
                         "current_floor": curr_f,
                         "total_floors": total_f,
                         "direction": details['dir'],
                         "entrance_type": details['ent'],
-                        "parking_total": clean_text(details['p_total']),
-                        "parking_per_unit": clean_text(details['p_per']),
+                        "parking_total": re.sub(r'[^0-9]', '', details['p_total']),
+                        "parking_per_unit": details['p_per'].replace("대", ""),
                         "heat_type": details['heat'],
-                        "maintenance_fee": clean_text(details['fee']),
+                        "maintenance_fee": re.sub(r'[^0-9]', '', details['fee']),
                         "move_in_date": details['move'],
                         "feature_desc": details['feat'],
                         "description": details['memo'],
@@ -201,10 +188,10 @@ async def run_full_production_crawl():
                     supabase.table("real_estate_articles").upsert(payload, on_conflict="article_no").execute()
 
                 except Exception as e:
-                    logger.error(f"⚠️ {article_no} 상세 페이지 스킵: {e}")
+                    logger.error(f"⚠️ {article_no} 스킵: {e}")
                     continue
 
-            logger.info(f"✨ [SUCCESS] {total_len}건 수집 및 저장 완료!")
+            logger.info(f"✨ [SUCCESS] {total_len}건 정밀 업데이트 완료!")
 
         except Exception as e:
             logger.error(f"❌ [CRITICAL] 프로세스 실패: {e}")
@@ -215,24 +202,18 @@ async def run_full_production_crawl():
 # --- [FastAPI 엔드포인트] ---
 
 @app.api_route("/", methods=["GET", "HEAD"])
-async def root():
-    return {"status": "online", "bot": "Zai Ace Bot is Awake"}
+async def root(): return {"status": "online"}
 
 @app.api_route("/run-crawl", methods=["GET", "HEAD"])
 async def trigger_crawl(background_tasks: BackgroundTasks):
     global last_crawl_time
     now = datetime.now()
-
     if last_crawl_time is None or (now - last_crawl_time).total_seconds() >= CRAWL_INTERVAL_SECONDS:
         last_crawl_time = now
-        logger.info(f"🔔 [TRIGGER] 수집 주기가 되었습니다. 작업을 실행합니다.")
         background_tasks.add_task(run_full_production_crawl)
-        return {"status": "started", "last_run": str(last_crawl_time)}
-    
-    remaining = int((CRAWL_INTERVAL_SECONDS - (now - last_crawl_time).total_seconds()) / 60)
-    return {"status": "skipping", "message": f"휴식 중입니다. {remaining}분 뒤에 오세요."}
+        return {"status": "started", "time": str(last_crawl_time)}
+    return {"status": "skipping"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, proxy_headers=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), proxy_headers=True)
