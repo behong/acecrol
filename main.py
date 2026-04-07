@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# 1. 초기 설정
+# 1. 초기 설정 및 로깅
 load_dotenv()
 app = FastAPI()
 
@@ -22,6 +22,7 @@ if not logger.handlers:
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
+# 2. 전역 변수 설정
 last_crawl_time = None
 CRAWL_INTERVAL_SECONDS = 43200 
 
@@ -29,13 +30,17 @@ supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_
 USER_ID = os.getenv("AI_PARTNER_ID")
 USER_PW = os.getenv("AI_PARTNER_PW")
 
-# --- [유틸리티 함수] ---
+# --- [유틸리티 함수: 데이터 정제 핵심] ---
 
 def safe_format_date(date_str):
+    """날짜 형식 변환: '26.04.02' -> '2026-04-02'"""
     try:
+        if not date_str: return datetime.now().strftime("%Y-%m-%d")
+        # [수정됨] split 결과인 리스트의 첫 번째 요소를 가져와서 strip 합니다.
         raw = date_str.split('~').strip() if '~' in date_str else date_str.strip()
         return datetime.strptime(raw, "%y.%m.%d").strftime("%Y-%m-%d")
-    except: return datetime.now().strftime("%Y-%m-%d")
+    except:
+        return datetime.now().strftime("%Y-%m-%d")
 
 async def take_debug_screenshot(page, name):
     try:
@@ -47,7 +52,7 @@ async def take_debug_screenshot(page, name):
 # --- [핵심 크롤링 로직] ---
 
 async def run_full_production_crawl():
-    logger.info("🚀 [CRAWL] 데이터 정제 로직이 강화된 수집을 시작합니다.")
+    logger.info("🚀 [CRAWL] 데이터 정밀 보정 수집을 시작합니다.")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -78,14 +83,14 @@ async def run_full_production_crawl():
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 대상 {total_len}건 분석 시작.")
+            logger.info(f"📊 대상 {total_len}건 수집 시작.")
 
-            # 4. 상세 페이지 루프
+            # 4. 상세 페이지 순회
             for idx, item in enumerate(list_items):
                 article_no = item['article_no']
                 detail_url = f"https://www.aipartner.com/offerings/detail/{article_no}"
                 
-                await asyncio.sleep(random.uniform(4.0, 7.0))
+                await asyncio.sleep(random.uniform(5.0, 9.0))
                 logger.info(f"🔎 [{idx+1}/{total_len}] 매물 분석: {article_no}")
                 
                 try:
@@ -116,20 +121,18 @@ async def run_full_production_crawl():
                         };
                     }""")
 
-                    # --- [데이터 정제 핵심부] ---
-                    
-                    # 1. articlename 정제: "동천자이 110동 3602호 (58696400)" -> "동천자이 110동 3602호"
-                    # 괄호 앞까지만 자름
+                    # --- [데이터 정제] ---
+                    # 1. articlename: "동천자이 110동 3602호 (58696400)" -> "동천자이 110동 3602호"
                     clean_name = details['name'].split('(').strip()
 
-                    # 2. floorinfo 정제: clean_name의 마지막 단어 (예: "3602호")
+                    # 2. floorinfo: clean_name의 마지막 단어 (예: "3602호")
                     name_parts = clean_name.split(' ')
                     floor_info = name_parts[-1] if len(name_parts) > 1 else ""
 
-                    # 3. dealorwarrantprc 정제: "120000만" -> "120000" (숫자만 남김)
+                    # 3. dealorwarrantprc: "120000만" -> "120000"
                     clean_price = re.sub(r'[^0-9]', '', details['price'])
 
-                    # 4. current_floor 정제: "해당 24층[중 / 36층]" -> "24"
+                    # 4. current_floor: "해당 24층[중 / 36층]" -> "24"
                     floor_nums = re.findall(r'\d+', details.get('floor_row', ''))
                     curr_f = floor_nums if floor_nums else ""
                     total_f = floor_nums[-1] if len(floor_nums) > 1 else ""
@@ -139,10 +142,10 @@ async def run_full_production_crawl():
                         "articlename": clean_name,
                         "realestatetypename": "아파트",
                         "tradetypename": "매매" if "매매" in details['name'] else "전세",
-                        "dealorwarrantprc": clean_price, # 순수 숫자 문자열
+                        "dealorwarrantprc": clean_price,
                         "articleconfirmymd": safe_format_date(details['date']),
-                        "buildingname": name_parts if name_parts else "", # "동천자이"
-                        "floorinfo": floor_info, # "3602호"
+                        "buildingname": name_parts if name_parts else "", 
+                        "floorinfo": floor_info, 
                         "room_count": re.sub(r'[^0-9]', '', details['room']),
                         "bath_count": re.sub(r'[^0-9]', '', details['bath']),
                         "current_floor": curr_f,
@@ -167,7 +170,7 @@ async def run_full_production_crawl():
                     logger.error(f"⚠️ {article_no} 스킵: {e}")
                     continue
 
-            logger.info(f"✨ [SUCCESS] {total_len}건 정제 완료!")
+            logger.info(f"✨ [SUCCESS] {total_len}건 정제 및 업데이트 완료!")
 
         except Exception as e:
             logger.error(f"❌ [CRITICAL] {e}")
