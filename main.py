@@ -22,21 +22,21 @@ if not logger.handlers:
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
-# 2. 전역 변수 설정
+# 2. 전역 변수 및 설정
 last_crawl_time = None
-CRAWL_INTERVAL_SECONDS = 43200 
+CRAWL_INTERVAL_SECONDS = 43200  # 12시간
 
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 USER_ID = os.getenv("AI_PARTNER_ID")
 USER_PW = os.getenv("AI_PARTNER_PW")
 
-# --- [유틸리티 함수: 데이터 정제 핵심] ---
+# --- [유틸리티 함수: 데이터 정제 및 에러 방지] ---
 
 def safe_format_date(date_str):
     """날짜 형식 변환: '26.04.02' -> '2026-04-02'"""
     try:
         if not date_str: return datetime.now().strftime("%Y-%m-%d")
-        # [수정됨] split 결과인 리스트의 첫 번째 요소를 가져와서 strip 합니다.
+        # [수정 완료] split('~') 결과인 리스트의 첫 번째 요소를 가져와서 strip 합니다.
         raw = date_str.split('~').strip() if '~' in date_str else date_str.strip()
         return datetime.strptime(raw, "%y.%m.%d").strftime("%Y-%m-%d")
     except:
@@ -52,7 +52,7 @@ async def take_debug_screenshot(page, name):
 # --- [핵심 크롤링 로직] ---
 
 async def run_full_production_crawl():
-    logger.info("🚀 [CRAWL] 데이터 정밀 보정 수집을 시작합니다.")
+    logger.info("🚀 [CRAWL] 데이터 정밀 수집 및 정제 프로세스를 시작합니다.")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -67,15 +67,16 @@ async def run_full_production_crawl():
             await page.goto("https://www.aipartner.com/integrated/login?serviceCode=1000", wait_until="domcontentloaded")
             await page.fill('input[placeholder*="아이디"]', USER_ID)
             await page.fill('input[placeholder*="비밀번호"]', USER_PW)
+            
             async with page.expect_navigation(wait_until="load", timeout=60000):
                 await page.keyboard.press("Enter")
             await page.wait_for_timeout(5000)
 
-            # 2. 리스트 페이지 이동
+            # 2. 매물 리스트 페이지 이동
             await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load", timeout=90000)
             await page.wait_for_selector("table.tableAdSale tbody tr", timeout=60000)
 
-            # 3. 매물번호 수집
+            # 3. 대상 매물 번호 확보
             list_items = await page.evaluate("""() => {
                 return Array.from(document.querySelectorAll("table.tableAdSale tbody tr"))
                     .map(row => ({ "article_no": row.querySelector(".numberA")?.innerText.trim() || "" }))
@@ -83,9 +84,9 @@ async def run_full_production_crawl():
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 대상 {total_len}건 수집 시작.")
+            logger.info(f"📊 대상 {total_len}건 수집 루프 시작.")
 
-            # 4. 상세 페이지 순회
+            # 4. 상세 페이지 순회 분석
             for idx, item in enumerate(list_items):
                 article_no = item['article_no']
                 detail_url = f"https://www.aipartner.com/offerings/detail/{article_no}"
@@ -97,42 +98,42 @@ async def run_full_production_crawl():
                     await page.goto(detail_url, wait_until="domcontentloaded", timeout=60000)
                     
                     details = await page.evaluate("""() => {
+                        const res = {};
                         const getV = (label) => {
                             const ths = Array.from(document.querySelectorAll('th'));
                             const target = ths.find(th => th.innerText.includes(label));
                             return target ? target.nextElementSibling.innerText.trim() : "";
                         };
-                        return {
-                            name: document.querySelector(".saleDetailName")?.innerText.trim() || "",
-                            price: getV("매물 가격"),
-                            date: getV("등록일"),
-                            floor_row: getV("층"),
-                            room: getV("방수"),
-                            bath: getV("욕실수"),
-                            dir: getV("방향"),
-                            ent: getV("현관구조"),
-                            p_total: getV("총 주차대수"),
-                            p_per: getV("세대당주차대수"),
-                            heat: getV("난방시설"),
-                            fee: document.querySelector(".price-wrap.total .price")?.innerText.trim() || "0",
-                            feat: getV("매물특징"),
-                            memo: document.querySelector("textarea")?.value || "",
-                            move: getV("입주 가능일")
-                        };
+                        res.name = document.querySelector(".saleDetailName")?.innerText.trim() || "";
+                        res.price = getV("매물 가격");
+                        res.date = getV("등록일");
+                        res.floor_row = getV("층");
+                        res.room = getV("방수");
+                        res.bath = getV("욕실수");
+                        res.dir = getV("방향");
+                        res.ent = getV("현관구조");
+                        res.p_total = getV("총 주차대수");
+                        res.p_per = getV("세대당주차대수");
+                        res.heat = getV("난방시설");
+                        res.fee = document.querySelector(".price-wrap.total .price")?.innerText.trim() || "0";
+                        res.feat = getV("매물특징");
+                        res.memo = document.querySelector("textarea")?.value || "";
+                        res.move = getV("입주 가능일");
+                        return res;
                     }""")
 
                     # --- [데이터 정제] ---
-                    # 1. articlename: "동천자이 110동 3602호 (58696400)" -> "동천자이 110동 3602호"
+                    # 1. articlename 정제 (괄호 안의 매물번호 제거)
                     clean_name = details['name'].split('(').strip()
 
-                    # 2. floorinfo: clean_name의 마지막 단어 (예: "3602호")
+                    # 2. floorinfo (마지막 단어인 호수만 추출)
                     name_parts = clean_name.split(' ')
                     floor_info = name_parts[-1] if len(name_parts) > 1 else ""
 
-                    # 3. dealorwarrantprc: "120000만" -> "120000"
+                    # 3. dealorwarrantprc (순수 숫자만 추출)
                     clean_price = re.sub(r'[^0-9]', '', details['price'])
 
-                    # 4. current_floor: "해당 24층[중 / 36층]" -> "24"
+                    # 4. 층수 숫자만 추출
                     floor_nums = re.findall(r'\d+', details.get('floor_row', ''))
                     curr_f = floor_nums if floor_nums else ""
                     total_f = floor_nums[-1] if len(floor_nums) > 1 else ""
@@ -144,8 +145,8 @@ async def run_full_production_crawl():
                         "tradetypename": "매매" if "매매" in details['name'] else "전세",
                         "dealorwarrantprc": clean_price,
                         "articleconfirmymd": safe_format_date(details['date']),
-                        "buildingname": name_parts if name_parts else "", 
-                        "floorinfo": floor_info, 
+                        "buildingname": name_parts if name_parts else "",
+                        "floorinfo": floor_info,
                         "room_count": re.sub(r'[^0-9]', '', details['room']),
                         "bath_count": re.sub(r'[^0-9]', '', details['bath']),
                         "current_floor": curr_f,
@@ -167,18 +168,18 @@ async def run_full_production_crawl():
                     supabase.table("real_estate_articles").upsert(payload, on_conflict="article_no").execute()
 
                 except Exception as e:
-                    logger.error(f"⚠️ {article_no} 스킵: {e}")
+                    logger.error(f"⚠️ {article_no} 처리 중 오류 스킵: {e}")
                     continue
 
-            logger.info(f"✨ [SUCCESS] {total_len}건 정제 및 업데이트 완료!")
+            logger.info(f"✨ [SUCCESS] {total_len}건 수집 및 정제 완료!")
 
         except Exception as e:
-            logger.error(f"❌ [CRITICAL] {e}")
+            logger.error(f"❌ [CRITICAL] 프로세스 실패: {e}")
             await take_debug_screenshot(page, "Critical_Error")
         finally:
             await browser.close()
 
-# --- [API 엔드포인트] ---
+# --- [FastAPI 엔드포인트] ---
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root(): return {"status": "online"}
@@ -195,4 +196,5 @@ async def trigger_crawl(background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), proxy_headers=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, proxy_headers=True)
