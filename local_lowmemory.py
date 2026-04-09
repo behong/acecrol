@@ -14,27 +14,25 @@ from fastapi import FastAPI, BackgroundTasks
 load_dotenv()
 app = FastAPI()
 
-logger = logging.getLogger("ZaiAceDeploy")
+logger = logging.getLogger("ZaiAceUltima")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     sh = logging.StreamHandler()
     sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     logger.addHandler(sh)
 
-# 전역 상태 관리
 last_crawl_time = None
-CRAWL_INTERVAL_SECONDS = 43200 # 12시간 주기
-
-# Supabase 연결
+CRAWL_INTERVAL_SECONDS = 43200 
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-# --- [유틸리티 함수: v6.0 검증 로직] ---
+# --- [안전 가드: 리스트 에러 원천 봉쇄 함수] ---
 
 def safe_split_first(text, separator):
-    """문자열을 자르고 첫 번째 조각을 안전하게 반환"""
+    """문자열을 자르고 첫 번째 조각을 안전하게 반환 (리스트 에러 방지용)"""
     try:
         t_str = str(text) if text else ""
         parts = t_str.split(separator)
+        # 리스트의 첫 번째 요소를 꺼낸 뒤 strip을 해야 에러가 안 납니다!
         return parts.strip() if parts else ""
     except:
         return ""
@@ -49,41 +47,25 @@ def safe_format_date(date_val):
         return datetime.now().strftime("%Y-%m-%d")
 
 def only_num(text):
-    """숫자만 추출"""
+    """단위 다 떼고 순수 숫자 문자열만 반환"""
     return re.sub(r'[^0-9]', '', str(text)) if text else ""
-
-async def block_aggressively(route):
-    """메모리 보호를 위해 무거운 리소스 차단 (배포 필수)"""
-    if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-        await route.abort()
-    else:
-        await route.continue_()
 
 # --- [핵심 크롤링 로직] ---
 
-async def run_production_crawl():
-    logger.info("🚀 [PRODUCTION] Render 최적화 수집 프로세스를 시작합니다.")
+async def run_ultima_crawl():
+    logger.info("🚀 [CRAWL] 에러 방지 로직이 적용된 최종 수집을 시작합니다.")
     
     async with async_playwright() as p:
-        # Render 무료 플랜 맞춤형 브라우저 인자
         browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', 
-                '--single-process',
-                '--disable-gpu'
-            ]
+            headless=True, # 로컬 테스트 시 False로 변경 가능
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
         )
-        # 메모리 효율을 위해 뷰포트 고정
-        context = await browser.new_context(viewport={'width': 1024, 'height': 800})
+        context = await browser.new_context(viewport={'width': 1280, 'height': 800})
         page = await context.new_page()
-        await page.route("**/*", block_aggressively)
 
         try:
             # 1. 로그인
-            logger.info("🔗 로그인 시도...")
+            logger.info("🔗 로그인 진행 중...")
             await page.goto("https://www.aipartner.com/integrated/login?serviceCode=1000", wait_until="domcontentloaded")
             await page.fill('input[placeholder*="아이디"]', os.getenv("AI_PARTNER_ID"))
             await page.fill('input[placeholder*="비밀번호"]', os.getenv("AI_PARTNER_PW"))
@@ -91,8 +73,8 @@ async def run_production_crawl():
                 await page.keyboard.press("Enter")
             await page.wait_for_timeout(3000)
 
-            # 2. 목록 확보
-            await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load")
+            # 2. 리스트 페이지 이동
+            await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load", timeout=90000)
             await page.wait_for_selector("table.tableAdSale tbody tr", timeout=60000)
 
             list_items = await page.evaluate("""() => {
@@ -102,17 +84,14 @@ async def run_production_crawl():
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 대상 {total_len}건 수집 루프 진입.")
+            logger.info(f"📊 {total_len}건 수집 루프 시작.")
 
             # 3. 상세 페이지 순회
             for idx, item in enumerate(list_items):
                 article_no = str(item['article_no'])
                 detail_url = f"https://www.aipartner.com/offerings/detail/{article_no}"
                 
-                # 매번 새 탭을 열고 닫아 메모리 누수 방지
                 det_page = await context.new_page()
-                await det_page.route("**/*", block_aggressively)
-
                 try:
                     await det_page.goto(detail_url, wait_until="domcontentloaded", timeout=60000)
                     
@@ -141,12 +120,18 @@ async def run_production_crawl():
                         };
                     }""")
 
-                    # [데이터 정제]
+                    # --- [안전한 데이터 가공 로직] ---
+                    
+                    # 1. articlename 정제 (괄호 제거)
+                    # safe_split_first 함수를 써서 리스트 에러를 원천 차단합니다.
                     clean_name = safe_split_first(data.get('name'), '(')
+                    
+                    # 2. 단지명(첫단어) 및 호수(마지막단어)
                     name_parts = clean_name.split(' ')
-                    b_name = name_parts if name_parts else ""
-                    f_info = name_parts[-1] if len(name_parts) > 1 else ""
+                    building_name = name_parts if name_parts else ""
+                    floor_info = name_parts[-1] if len(name_parts) > 1 else ""
 
+                    # 3. 층수 추출 (리스트 방지)
                     f_nums = re.findall(r'\d+', str(data.get('floor_raw', '')))
                     c_floor = f_nums if f_nums else ""
                     t_floor = f_nums[-1] if len(f_nums) > 1 else ""
@@ -158,8 +143,8 @@ async def run_production_crawl():
                         "tradetypename": "매매" if "매매" in str(data.get('name')) else "전세",
                         "dealorwarrantprc": only_num(data.get('price')),
                         "articleconfirmymd": safe_format_date(data.get('date')),
-                        "buildingname": str(b_name),
-                        "floorinfo": str(f_info),
+                        "buildingname": str(building_name),
+                        "floorinfo": str(floor_info),
                         "room_count": only_num(data.get('room')),
                         "bath_count": only_num(data.get('bath')),
                         "current_floor": str(c_floor),
@@ -182,13 +167,13 @@ async def run_production_crawl():
                     logger.info(f"✅ [{idx+1}/{total_len}] 저장: {article_no}")
 
                 except Exception as inner_e:
-                    logger.error(f"⚠️ {article_no} 분석 실패: {inner_e}")
+                    logger.error(f"⚠️ {article_no} 처리 중 에러: {inner_e}")
                 finally:
-                    await det_page.close() # 탭 즉시 닫기
+                    await det_page.close()
                 
-                await asyncio.sleep(random.uniform(5, 8)) # Render 서버 부하 방지 휴식
+                await asyncio.sleep(random.uniform(4, 7))
 
-            logger.info("✨ [SUCCESS] 수집 완료!")
+            logger.info("✨ [SUCCESS] 전체 수집 완료!")
 
         finally:
             await browser.close()
@@ -197,24 +182,18 @@ async def run_production_crawl():
 # --- [FastAPI 엔드포인트] ---
 
 @app.get("/")
-async def root():
-    return {"status": "online", "message": "Zai Ace Bot is Awake"}
+async def root(): return {"status": "online"}
 
 @app.api_route("/run-crawl", methods=["GET", "HEAD"])
 async def trigger_crawl(background_tasks: BackgroundTasks):
     global last_crawl_time
     now = datetime.now()
-    
     if last_crawl_time is None or (now - last_crawl_time).total_seconds() >= CRAWL_INTERVAL_SECONDS:
         last_crawl_time = now
-        background_tasks.add_task(run_production_crawl)
-        return {"status": "started", "time": str(last_crawl_time)}
-    
-    rem = int((CRAWL_INTERVAL_SECONDS - (now - last_crawl_time).total_seconds()) / 60)
-    return {"status": "skipping", "message": f"{rem}분 후에 다시 오세요."}
+        background_tasks.add_task(run_ultima_crawl)
+        return {"status": "started"}
+    return {"status": "skipping"}
 
 if __name__ == "__main__":
     import uvicorn
-    # Render의 PORT 환경 변수 대응
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
