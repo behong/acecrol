@@ -4,7 +4,6 @@ import logging
 import random
 import re
 import gc
-import base64
 from datetime import datetime, timedelta
 from fastapi import FastAPI, BackgroundTasks
 from playwright.async_api import async_playwright
@@ -23,29 +22,35 @@ if not logger.handlers:
     logger.addHandler(sh)
 
 last_crawl_time = None
-CRAWL_INTERVAL_SECONDS = 43200 
+CRAWL_INTERVAL_SECONDS = 43200 # 12시간
 
+# Supabase 및 로그인 정보
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 USER_ID = os.getenv("AI_PARTNER_ID")
 USER_PW = os.getenv("AI_PARTNER_PW")
 
-# --- [유틸리티 함수: 에러 방지 핵심] ---
+# --- [유틸리티 함수: 에러 및 리스트 형태 원천 차단] ---
 
 def safe_format_date(date_str):
-    """'26.04.02 ~ 26.05.02' -> '2026-04-02' 변환 (인덱스 에러 완벽 방어)"""
+    """날짜 형식 변환: '26.04.02 ~ 26.05.02' -> '2026-04-02'"""
     try:
-        if not date_str: return datetime.now().strftime("%Y-%m-%d")
-        # [해결] split('~')을 한 후 반드시으로 첫 번째 문자열을 꺼낸 뒤 strip() 해야 합니다.
-        if '~' in date_str:
-            raw = date_str.split('~').strip()
+        if not date_str: 
+            return datetime.now().strftime("%Y-%m-%d")
+        
+        # [수정 완료] 리스트 에러 방지용 명시적 처리
+        date_str_clean = str(date_str)
+        if '~' in date_str_clean:
+            parts = date_str_clean.split('~')
+            raw = parts.strip() # 첫 번째 요소를 확실히 꺼낸 후 strip
         else:
-            raw = date_str.strip()
+            raw = date_str_clean.strip()
+            
         return datetime.strptime(raw, "%y.%m.%d").strftime("%Y-%m-%d")
-    except: 
+    except:
         return datetime.now().strftime("%Y-%m-%d")
 
 async def block_aggressively(route):
-    """Render 512MB 메모리 사수를 위해 미디어 차단"""
+    """메모리 보호를 위해 이미지/폰트/CSS 차단"""
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         await route.abort()
     else:
@@ -54,20 +59,22 @@ async def block_aggressively(route):
 # --- [핵심 크롤링 로직] ---
 
 async def run_optimized_crawl():
-    logger.info("🚀 [CRAWL] 메모리 최적화 및 최종 에러 수정 버전 가동")
+    logger.info("🚀 [CRAWL] 최적화 수집 프로세스를 시작합니다.")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
         )
-        context = await browser.new_context(viewport={'width': 800, 'height': 600})
+        context = await browser.new_context(viewport={'width': 1024, 'height': 800})
         page = await context.new_page()
+        
+        # 리소스 차단 적용
         await page.route("**/*", block_aggressively)
 
         try:
             # 1. 로그인
-            logger.info("🔗 로그인 시도...")
+            logger.info("🔗 로그인 접속 중...")
             await page.goto("https://www.aipartner.com/integrated/login?serviceCode=1000", wait_until="domcontentloaded")
             await page.fill('input[placeholder*="아이디"]', USER_ID)
             await page.fill('input[placeholder*="비밀번호"]', USER_PW)
@@ -81,6 +88,7 @@ async def run_optimized_crawl():
             await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load", timeout=90000)
             await page.wait_for_selector("table.tableAdSale tbody tr", timeout=60000)
 
+            # 목록 가져오기
             list_items = await page.evaluate("""() => {
                 return Array.from(document.querySelectorAll("table.tableAdSale tbody tr"))
                     .map(row => ({ "article_no": row.querySelector(".numberA")?.innerText.trim() || "" }))
@@ -88,7 +96,7 @@ async def run_optimized_crawl():
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 대상 {total_len}건 수집을 시작합니다.")
+            logger.info(f"📊 대상 {total_len}건 수집 시작.")
 
             # 3. 상세 페이지 순회
             for idx, item in enumerate(list_items):
@@ -123,34 +131,43 @@ async def run_optimized_crawl():
                         };
                     }""")
 
-                    # --- [데이터 정제: 리스트 방지 및 호수 추출] ---
-                    clean_name = details['name'].split('(').strip()
-                    name_parts = clean_name.split(' ')
-                    clean_price = re.sub(r'[^0-9]', '', details['price'])
-                    floor_nums = re.findall(r'\d+', details.get('floor_row', ''))
+                    # --- [데이터 정제: 리스트/매물번호 완벽 제거] ---
                     
+                    # 1. articlename: "동천자이 110동 3602호 (58696400)" -> "동천자이 110동 3602호"
+                    full_name = str(details['name']).split('(').strip()
+                    
+                    # 2. buildingname & floorinfo: "동천자이", "3602호"
+                    name_parts = full_name.split(' ')
+                    b_name = name_parts if name_parts else ""
+                    f_info = name_parts[-1] if len(name_parts) > 1 else ""
+
+                    # 3. dealorwarrantprc: 숫자만
+                    clean_price = re.sub(r'[^0-9]', '', str(details['price']))
+
+                    # 4. current_floor & total_floors: "24", "36"
+                    floor_nums = re.findall(r'\d+', str(details.get('floor_row', '')))
+                    c_floor = floor_nums if floor_nums else ""
+                    t_floor = floor_nums[-1] if len(floor_nums) > 1 else ""
+
                     payload = {
                         "article_no": article_no,
-                        "articlename": clean_name,
+                        "articlename": full_name,
                         "realestatetypename": "아파트",
                         "tradetypename": "매매" if "매매" in details['name'] else "전세",
                         "dealorwarrantprc": clean_price,
                         "articleconfirmymd": safe_format_date(details['date']),
-                        # [해결] 리스트가 아닌 첫 번째 단어 문자열만 저장
-                        "buildingname": name_parts if name_parts else "",
-                        # [해결] 매물번호가 아닌 마지막 호수/층 정보만 저장
-                        "floorinfo": name_parts[-1] if len(name_parts) > 1 else "",
-                        "room_count": re.sub(r'[^0-9]', '', details['room']),
-                        "bath_count": re.sub(r'[^0-9]', '', details['bath']),
-                        # [해결] 리스트가 아닌 숫자 하나만 저장
-                        "current_floor": floor_nums if floor_nums else "",
-                        "total_floors": floor_nums[-1] if len(floor_nums) > 1 else "",
+                        "buildingname": str(b_name), # 리스트 방지 강제 형변환
+                        "floorinfo": str(f_info),    # 리스트 방지 강제 형변환
+                        "room_count": re.sub(r'[^0-9]', '', str(details['room'])),
+                        "bath_count": re.sub(r'[^0-9]', '', str(details['bath'])),
+                        "current_floor": str(c_floor), # 리스트 방지 강제 형변환
+                        "total_floors": str(t_floor),
                         "direction": details['dir'],
                         "entrance_type": details['ent'],
-                        "parking_total": re.sub(r'[^0-9]', '', details['p_total']),
-                        "parking_per_unit": details['p_per'].replace("대", ""),
+                        "parking_total": re.sub(r'[^0-9]', '', str(details['p_total'])),
+                        "parking_per_unit": str(details['p_per']).replace("대", ""),
                         "heat_type": details['heat'],
-                        "maintenance_fee": re.sub(r'[^0-9]', '', details['fee']),
+                        "maintenance_fee": re.sub(r'[^0-9]', '', str(details['fee'])),
                         "move_in_date": details['move'],
                         "feature_desc": details['feat'],
                         "description": details['memo'],
@@ -159,16 +176,18 @@ async def run_optimized_crawl():
                         "updated_at": datetime.now().isoformat()
                     }
                     
+                    # Supabase 전송
                     supabase.table("real_estate_articles").upsert(payload, on_conflict="article_no").execute()
-                    logger.info(f"✅ [{idx+1}/{total_len}] 저장 완료: {article_no}")
+                    logger.info(f"✅ [{idx+1}/{total_len}] 저장: {article_no}")
 
                 except Exception as e:
-                    logger.error(f"⚠️ {article_no} 분석 중 에러: {e}")
+                    logger.error(f"⚠️ {article_no} 처리 오류: {e}")
                 
+                # 메모리 청소
                 if idx % 5 == 0: gc.collect()
                 await asyncio.sleep(random.uniform(4, 7))
 
-            logger.info("✨ [SUCCESS] 모든 매물 수집 완료!")
+            logger.info("✨ [SUCCESS] 전체 수집 완료!")
 
         except Exception as e:
             logger.error(f"❌ [CRITICAL] 프로세스 실패: {e}")
@@ -176,7 +195,7 @@ async def run_optimized_crawl():
             await browser.close()
             gc.collect()
 
-# --- [API 엔드포인트] ---
+# --- [FastAPI 엔드포인트] ---
 
 @app.get("/")
 async def root(): return {"status": "online"}
@@ -189,11 +208,8 @@ async def trigger_crawl(background_tasks: BackgroundTasks):
         last_crawl_time = now
         background_tasks.add_task(run_optimized_crawl)
         return {"status": "started", "time": str(last_crawl_time)}
-    
-    remaining = int((CRAWL_INTERVAL_SECONDS - (now - last_crawl_time).total_seconds()) / 60)
-    return {"status": "skipping", "message": f"{remaining}분 남음"}
+    return {"status": "skipping"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
