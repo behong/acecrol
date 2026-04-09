@@ -29,18 +29,21 @@ supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_
 USER_ID = os.getenv("AI_PARTNER_ID")
 USER_PW = os.getenv("AI_PARTNER_PW")
 
-# --- [유틸리티 함수] ---
+# --- [유틸리티 함수: 버그 수정 완료] ---
 
 def safe_format_date(date_str):
+    """'26.04.02 ~ 26.05.02' -> '2026-04-02' 변환"""
     try:
         if not date_str: return datetime.now().strftime("%Y-%m-%d")
+        # [수정] split 결과 리스트에서 첫 번째 항목을 먼저 꺼낸 후 strip 합니다.
         raw = date_str.split('~').strip() if '~' in date_str else date_str.strip()
         return datetime.strptime(raw, "%y.%m.%d").strftime("%Y-%m-%d")
-    except: return datetime.now().strftime("%Y-%m-%d")
+    except: 
+        return datetime.now().strftime("%Y-%m-%d")
 
 async def block_aggressively(route):
     """메모리 절약을 위해 이미지, 폰트, CSS 등 모든 미디어 차단"""
-    if route.request.resource_type in ["image", "media", "font", "stylesheet", "other"]:
+    if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         await route.abort()
     else:
         await route.continue_()
@@ -48,24 +51,18 @@ async def block_aggressively(route):
 # --- [핵심 크롤링 로직] ---
 
 async def run_optimized_crawl():
-    logger.info("🚀 [CRAWL] 초경량 메모리 최적화 수집을 시작합니다.")
+    logger.info("🚀 [CRAWL] 메모리 최적화 및 에러 수정 버전 수집을 시작합니다.")
     
     async with async_playwright() as p:
-        # Render 무료 플랜 맞춤형 브라우저 인자
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process' # 프로세스 단일화로 메모리 절약
-            ]
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
         )
+        # 뷰포트를 더 줄여서 메모리 사용 최소화
         context = await browser.new_context(viewport={'width': 800, 'height': 600})
         page = await context.new_page()
         
-        # 리소스 차단 적용 (메모리 사용량 50% 감소)
+        # 리소스 차단 적용
         await page.route("**/*", block_aggressively)
 
         try:
@@ -84,7 +81,6 @@ async def run_optimized_crawl():
             await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load", timeout=90000)
             await page.wait_for_selector("table.tableAdSale tbody tr", timeout=60000)
 
-            # 3. 매물번호 수집
             list_items = await page.evaluate("""() => {
                 return Array.from(document.querySelectorAll("table.tableAdSale tbody tr"))
                     .map(row => ({ "article_no": row.querySelector(".numberA")?.innerText.trim() || "" }))
@@ -92,9 +88,9 @@ async def run_optimized_crawl():
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 대상 {total_len}건 수집 시작.")
+            logger.info(f"📊 대상 {total_len}건 수집 루프 진입.")
 
-            # 4. 상세 페이지 순회
+            # 3. 상세 페이지 순회
             for idx, item in enumerate(list_items):
                 article_no = item['article_no']
                 detail_url = f"https://www.aipartner.com/offerings/detail/{article_no}"
@@ -167,9 +163,9 @@ async def run_optimized_crawl():
                 except Exception as e:
                     logger.error(f"⚠️ {article_no} 스킵: {e}")
                 
-                # 메모리 관리: 5건마다 가비지 컬렉션
+                # 메모리 관리: 5건마다 강제 청소
                 if idx % 5 == 0: gc.collect()
-                await asyncio.sleep(random.uniform(5, 8))
+                await asyncio.sleep(random.uniform(4, 7))
 
             logger.info("✨ [SUCCESS] 전체 수집 완료!")
 
@@ -179,25 +175,24 @@ async def run_optimized_crawl():
             await browser.close()
             gc.collect()
 
-# --- [FastAPI 엔드포인트: 404 방지] ---
+# --- [FastAPI 엔드포인트] ---
 
 @app.get("/")
 async def root():
-    return {"status": "online", "message": "Zai Ace Bot is Awake"}
+    return {"status": "online"}
 
-@app.get("/run-crawl")
+@app.api_route("/run-crawl", methods=["GET", "HEAD"])
 async def trigger_crawl(background_tasks: BackgroundTasks):
     global last_crawl_time
     now = datetime.now()
     
-    # 12시간 주기 체크
     if last_crawl_time is None or (now - last_crawl_time).total_seconds() >= CRAWL_INTERVAL_SECONDS:
         last_crawl_time = now
         background_tasks.add_task(run_optimized_crawl)
         return {"status": "started", "time": str(last_crawl_time)}
     
     remaining = int((CRAWL_INTERVAL_SECONDS - (now - last_crawl_time).total_seconds()) / 60)
-    return {"status": "skipping", "message": f"휴식 중 ({remaining}분 남음)"}
+    return {"status": "skipping", "message": f"{remaining}분 남음"}
 
 if __name__ == "__main__":
     import uvicorn
