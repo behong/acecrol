@@ -14,7 +14,7 @@ from fastapi import FastAPI, BackgroundTasks
 load_dotenv()
 app = FastAPI()
 
-logger = logging.getLogger("ZaiAceDeploy")
+logger = logging.getLogger("ZaiAceDeployV8")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     sh = logging.StreamHandler()
@@ -23,28 +23,36 @@ if not logger.handlers:
 
 # 전역 상태 관리
 last_crawl_time = None
-CRAWL_INTERVAL_SECONDS = 43200 # 12시간 주기
+CRAWL_INTERVAL_SECONDS = 43200 
 
 # Supabase 연결
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-# --- [유틸리티 함수: v6.0 검증 로직] ---
+# --- [안전 가드: 로컬에서 성공한 v8.0 정규식 로직] ---
 
-def safe_split_first(text, separator):
-    """문자열을 자르고 첫 번째 조각을 안전하게 반환"""
+def super_safe_cleaner(val):
+    """정규식을 사용하여 리스트 에러를 원천 차단하고 이름만 추출"""
     try:
-        t_str = str(text) if text else ""
-        parts = t_str.split(separator)
-        return parts.strip() if parts else ""
+        if not val: return ""
+        # 1. 리스트로 들어올 경우 첫 번째 값만 사용
+        if isinstance(val, list):
+            val = val if val else ""
+        
+        text = str(val).strip()
+        # 2. 정규식: 여는 괄호 '(' 앞까지만 텍스트 추출 (리스트 에러 발생 안 함)
+        match = re.search(r'^[^(\n]+', text)
+        if match:
+            return match.group(0).strip()
+        return text
     except:
         return ""
 
 def safe_format_date(date_val):
-    """날짜 변환: '26.04.02 ~ 26.05.02' -> '2026-04-02'"""
+    """날짜 변환: '26.04.10' -> '2026-04-10'"""
     try:
-        raw = safe_split_first(date_val, '~')
-        if not raw: return datetime.now().strftime("%Y-%m-%d")
-        return datetime.strptime(raw, "%y.%m.%d").strftime("%Y-%m-%d")
+        clean_d = super_safe_cleaner(date_val) # 안전 정제기 재사용
+        if not clean_d: return datetime.now().strftime("%Y-%m-%d")
+        return datetime.strptime(clean_d, "%y.%m.%d").strftime("%Y-%m-%d")
     except:
         return datetime.now().strftime("%Y-%m-%d")
 
@@ -52,8 +60,8 @@ def only_num(text):
     """숫자만 추출"""
     return re.sub(r'[^0-9]', '', str(text)) if text else ""
 
-async def block_aggressively(route):
-    """메모리 보호를 위해 무거운 리소스 차단 (배포 필수)"""
+async def block_resources(route):
+    """Render 메모리 보호를 위해 무거운 리소스 차단"""
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         await route.abort()
     else:
@@ -62,34 +70,24 @@ async def block_aggressively(route):
 # --- [핵심 크롤링 로직] ---
 
 async def run_production_crawl():
-    logger.info("🚀 [PRODUCTION] Render 최적화 수집 프로세스를 시작합니다.")
+    logger.info("🚀 [PRODUCTION v8.0] Render 배포용 최종 수집을 시작합니다.")
     
     async with async_playwright() as p:
-        # Render 무료 플랜 맞춤형 브라우저 인자
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', 
-                '--single-process',
-                '--disable-gpu'
-            ]
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process', '--disable-gpu']
         )
-        # 메모리 효율을 위해 뷰포트 고정
-        context = await browser.new_context(viewport={'width': 1024, 'height': 800})
+        context = await browser.new_context(viewport={'width': 1280, 'height': 800})
         page = await context.new_page()
-        await page.route("**/*", block_aggressively)
 
         try:
             # 1. 로그인
-            logger.info("🔗 로그인 시도...")
+            logger.info("🔗 로그인 접속 중...")
             await page.goto("https://www.aipartner.com/integrated/login?serviceCode=1000", wait_until="domcontentloaded")
             await page.fill('input[placeholder*="아이디"]', os.getenv("AI_PARTNER_ID"))
             await page.fill('input[placeholder*="비밀번호"]', os.getenv("AI_PARTNER_PW"))
-            async with page.expect_navigation(wait_until="load", timeout=60000):
-                await page.keyboard.press("Enter")
-            await page.wait_for_timeout(3000)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(5000)
 
             # 2. 목록 확보
             await page.goto("https://www.aipartner.com/offerings/ad_list", wait_until="load")
@@ -102,19 +100,21 @@ async def run_production_crawl():
             }""")
 
             total_len = len(list_items)
-            logger.info(f"📊 대상 {total_len}건 수집 루프 진입.")
+            logger.info(f"📊 대상 {total_len}건 분석 시작.")
 
             # 3. 상세 페이지 순회
             for idx, item in enumerate(list_items):
                 article_no = str(item['article_no'])
                 detail_url = f"https://www.aipartner.com/offerings/detail/{article_no}"
                 
-                # 매번 새 탭을 열고 닫아 메모리 누수 방지
                 det_page = await context.new_page()
-                await det_page.route("**/*", block_aggressively)
+                await det_page.route("**/*", block_resources)
 
                 try:
                     await det_page.goto(detail_url, wait_until="domcontentloaded", timeout=60000)
+                    
+                    # ⭐ [핵심] 제목 로딩 대기
+                    await det_page.wait_for_selector(".saleDetailName", timeout=10000)
                     
                     data = await det_page.evaluate("""() => {
                         const getV = (label) => {
@@ -129,33 +129,27 @@ async def run_production_crawl():
                             floor_raw: getV("층"),
                             room: getV("방수"),
                             bath: getV("욕실수"),
-                            dir: getV("방향"),
-                            ent: getV("현관구조"),
-                            p_total: getV("총 주차대수"),
-                            p_per: getV("세대당주차대수"),
-                            heat: getV("난방시설"),
-                            fee: document.querySelector(".price-wrap.total .price")?.innerText.trim() || "0",
-                            feat: getV("매물특징"),
-                            memo: document.querySelector("textarea")?.value || "",
-                            move: getV("입주 가능일")
+                            dir: getV("방향")
                         };
                     }""")
 
-                    # [데이터 정제]
-                    clean_name = safe_split_first(data.get('name'), '(')
-                    name_parts = clean_name.split(' ')
+                    # --- [데이터 정제: 정규식 기반] ---
+                    raw_name = str(data.get('name', ''))
+                    clean_articlename = super_safe_cleaner(raw_name)
+                    
+                    # 아파트명과 호수 분리
+                    name_parts = clean_articlename.split(' ')
                     b_name = name_parts if name_parts else ""
                     f_info = name_parts[-1] if len(name_parts) > 1 else ""
 
                     f_nums = re.findall(r'\d+', str(data.get('floor_raw', '')))
                     c_floor = f_nums if f_nums else ""
-                    t_floor = f_nums[-1] if len(f_nums) > 1 else ""
 
                     payload = {
                         "article_no": article_no,
-                        "articlename": clean_name,
+                        "articlename": str(clean_articlename),
                         "realestatetypename": "아파트",
-                        "tradetypename": "매매" if "매매" in str(data.get('name')) else "전세",
+                        "tradetypename": "매매" if "매매" in raw_name else "전세",
                         "dealorwarrantprc": only_num(data.get('price')),
                         "articleconfirmymd": safe_format_date(data.get('date')),
                         "buildingname": str(b_name),
@@ -163,32 +157,23 @@ async def run_production_crawl():
                         "room_count": only_num(data.get('room')),
                         "bath_count": only_num(data.get('bath')),
                         "current_floor": str(c_floor),
-                        "total_floors": str(t_floor),
                         "direction": str(data.get('dir')),
-                        "entrance_type": str(data.get('ent')),
-                        "parking_total": only_num(data.get('p_total')),
-                        "parking_per_unit": str(data.get('p_per')).replace("대", ""),
-                        "heat_type": str(data.get('heat')),
-                        "maintenance_fee": only_num(data.get('fee')),
-                        "move_in_date": str(data.get('move')),
-                        "feature_desc": str(data.get('feat')),
-                        "description": str(data.get('memo')),
                         "realtorname": "자이에이스",
                         "cppcarticleurl": f"https://new.land.naver.com/?articleNo={article_no}",
                         "updated_at": datetime.now().isoformat()
                     }
                     
                     supabase.table("real_estate_articles").upsert(payload, on_conflict="article_no").execute()
-                    logger.info(f"✅ [{idx+1}/{total_len}] 저장: {article_no}")
+                    logger.info(f"✅ [{idx+1}/{total_len}] 저장: {article_no} | {clean_articlename}")
 
                 except Exception as inner_e:
-                    logger.error(f"⚠️ {article_no} 분석 실패: {inner_e}")
+                    logger.error(f"⚠️ {article_no} 오류: {inner_e}")
                 finally:
-                    await det_page.close() # 탭 즉시 닫기
+                    await det_page.close()
                 
-                await asyncio.sleep(random.uniform(5, 8)) # Render 서버 부하 방지 휴식
+                await asyncio.sleep(random.uniform(5, 8))
 
-            logger.info("✨ [SUCCESS] 수집 완료!")
+            logger.info("✨ [SUCCESS] 전체 수집 완료!")
 
         finally:
             await browser.close()
@@ -197,24 +182,19 @@ async def run_production_crawl():
 # --- [FastAPI 엔드포인트] ---
 
 @app.get("/")
-async def root():
-    return {"status": "online", "message": "Zai Ace Bot is Awake"}
+async def root(): return {"status": "online"}
 
 @app.api_route("/run-crawl", methods=["GET", "HEAD"])
 async def trigger_crawl(background_tasks: BackgroundTasks):
     global last_crawl_time
     now = datetime.now()
-    
     if last_crawl_time is None or (now - last_crawl_time).total_seconds() >= CRAWL_INTERVAL_SECONDS:
         last_crawl_time = now
         background_tasks.add_task(run_production_crawl)
         return {"status": "started", "time": str(last_crawl_time)}
-    
-    rem = int((CRAWL_INTERVAL_SECONDS - (now - last_crawl_time).total_seconds()) / 60)
-    return {"status": "skipping", "message": f"{rem}분 후에 다시 오세요."}
+    return {"status": "skipping"}
 
 if __name__ == "__main__":
     import uvicorn
-    # Render의 PORT 환경 변수 대응
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
